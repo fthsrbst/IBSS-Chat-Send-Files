@@ -147,7 +147,9 @@ class P2PChatGUI:
             ip = ip_entry.get().strip()
             if ip:
                 dialog.destroy()
-                self.connect_to_peer(ip)
+                self.add_system_message(f"🔄 {ip} adresine bağlanılıyor...")
+                # Thread'de çalıştır
+                threading.Thread(target=self.connect_to_peer, args=(ip,), daemon=True).start()
 
         ip_entry.bind('<Return>', lambda e: connect())
         ttk.Button(dialog, text="Bağlan", command=connect).pack(pady=10)
@@ -160,7 +162,8 @@ class P2PChatGUI:
 
         filepath = filedialog.askopenfilename(title="Dosya Seçin")
         if filepath:
-            self.send_file(filepath)
+            self.add_system_message(f"📤 Dosya gönderiliyor: {os.path.basename(filepath)}")
+            threading.Thread(target=self.send_file, args=(filepath,), daemon=True).start()
 
     def add_system_message(self, text):
         """Sistem mesajı ekle"""
@@ -208,6 +211,7 @@ class P2PChatGUI:
     def handle_client(self, client_socket, address):
         """Client ile iletişimi yönet"""
         peer_name = None
+        buffer = ""
         try:
             # Handshake
             data = client_socket.recv(4096).decode('utf-8')
@@ -223,7 +227,8 @@ class P2PChatGUI:
                         'type': 'handshake',
                         'username': self.username
                     }
-                    client_socket.send(json.dumps(response).encode('utf-8'))
+                    response_data = json.dumps(response) + "\n"
+                    client_socket.send(response_data.encode('utf-8'))
 
                     # GUI güncelle
                     self.root.after(0, lambda: self.add_system_message(f"{peer_name} bağlandı"))
@@ -231,12 +236,19 @@ class P2PChatGUI:
 
             # Mesajları dinle
             while self.running:
-                data = client_socket.recv(4096).decode('utf-8')
-                if not data:
+                chunk = client_socket.recv(65536).decode('utf-8')
+                if not chunk:
                     break
 
-                message = json.loads(data)
-                self.handle_message(message, peer_name)
+                buffer += chunk
+                while '\n' in buffer:
+                    line, buffer = buffer.split('\n', 1)
+                    if line.strip():
+                        try:
+                            message = json.loads(line)
+                            self.handle_message(message, peer_name)
+                        except json.JSONDecodeError:
+                            pass
 
         except:
             pass
@@ -271,26 +283,36 @@ class P2PChatGUI:
         """Peer'a bağlan"""
         try:
             client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            client_socket.settimeout(5)  # 5 saniye timeout
             client_socket.connect((ip, self.port))
+            client_socket.settimeout(None)  # Timeout'u kaldır
 
             # Handshake
             handshake = {
                 'type': 'handshake',
                 'username': self.username
             }
-            client_socket.send(json.dumps(handshake).encode('utf-8'))
+            handshake_data = json.dumps(handshake) + "\n"
+            client_socket.send(handshake_data.encode('utf-8'))
 
             # Yanıt bekle
-            data = client_socket.recv(4096).decode('utf-8')
-            response = json.loads(data)
+            buffer = ""
+            while '\n' not in buffer:
+                chunk = client_socket.recv(4096).decode('utf-8')
+                if not chunk:
+                    raise Exception("Bağlantı koptu")
+                buffer += chunk
+
+            line = buffer.split('\n', 1)[0]
+            response = json.loads(line)
             peer_name = response['username']
 
             # Peer'ı ekle
             peer_info = (ip, client_socket, peer_name)
             self.peers.add(peer_info)
 
-            self.add_system_message(f"{peer_name} ile bağlantı kuruldu")
-            self.update_users_list()
+            self.root.after(0, lambda: self.add_system_message(f"✅ {peer_name} ile bağlantı kuruldu"))
+            self.root.after(0, self.update_users_list)
 
             # Mesajları dinle
             threading.Thread(
@@ -299,8 +321,10 @@ class P2PChatGUI:
                 daemon=True
             ).start()
 
+        except socket.timeout:
+            self.root.after(0, lambda: self.add_system_message(f"❌ Bağlantı zaman aşımı: {ip}"))
         except Exception as e:
-            messagebox.showerror("Hata", f"Bağlantı hatası: {e}")
+            self.root.after(0, lambda: self.add_system_message(f"❌ Bağlantı hatası: {e}"))
 
     def send_message(self):
         """Mesaj gönder"""
@@ -339,19 +363,19 @@ class P2PChatGUI:
             }
 
             self.broadcast(message)
-            self.add_system_message(f"📁 Dosya gönderildi: {filename}")
+            self.root.after(0, lambda: self.add_system_message(f"✅ Dosya gönderildi: {filename}"))
 
         except Exception as e:
-            messagebox.showerror("Hata", f"Dosya gönderme hatası: {e}")
+            self.root.after(0, lambda: self.add_system_message(f"❌ Dosya gönderme hatası: {e}"))
 
     def broadcast(self, message):
         """Mesajı tüm peer'lara gönder"""
-        data = json.dumps(message).encode('utf-8')
+        data = (json.dumps(message) + "\n").encode('utf-8')
         disconnected = []
 
         for peer_ip, peer_socket, peer_name in self.peers:
             try:
-                peer_socket.send(data)
+                peer_socket.sendall(data)
             except:
                 disconnected.append((peer_ip, peer_socket, peer_name))
 
@@ -360,7 +384,7 @@ class P2PChatGUI:
             self.peers.discard(peer)
 
         if disconnected:
-            self.update_users_list()
+            self.root.after(0, self.update_users_list)
 
     def on_closing(self):
         """Uygulama kapanırken"""
